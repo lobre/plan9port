@@ -11,13 +11,15 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <linux/input-event-codes.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "bigarrow.h"
 #include "devdraw.h"
-#include "wayland-pointer-constraints.h"
+#include "wayland-clip.h"
+#include "wayland-pointer-warp.h"
 #include "wayland-xdg-decoration.h"
 #include "wayland-xdg-shell.h"
 
@@ -59,6 +61,8 @@ struct WaylandClient {
 	int repeat_interval_ms;
 	int repeat_delay_ms;
 
+	uint32_t pointer_enter_serial;
+
 	// The Wayland surface for this window
 	// and its corresponding xdg objects.
 	struct wl_surface *wl_surface;
@@ -75,6 +79,7 @@ struct WaylandClient {
 	// Surface size in buffer pixels (may include CSD border).
 	int surface_w;
 	int surface_h;
+	int buffer_scale;
 	int csd_thickness;
 	int content_offset_x;
 	int content_offset_y;
@@ -98,6 +103,7 @@ struct WaylandClient {
 typedef struct WaylandClient WaylandClient;
 
 static QLock wayland_lock;
+// Wayland calls from rpc_* use wayland_lock; only gfx_main dispatches.
 
 // Required globals wayland objects.
 static struct wl_display *wl_display;
@@ -110,13 +116,10 @@ static struct wl_seat *wl_seat;
 static struct wl_data_device_manager *wl_data_device_manager;
 static struct wl_data_device *wl_data_device;
 
-static char *snarf;
-uint32_t keyboard_enter_serial;
-
 // Optional global wayland objects.
 // Need to NULL check them before using.
 static struct zxdg_decoration_manager_v1 *decoration_manager;
-static struct zwp_pointer_constraints_v1 *pointer_constraints;
+static struct wp_pointer_warp_v1 *pointer_warp;
 
 // The wl output scale factor reported by wl_output.
 // We only set it if we get th event before entering the graphics loop.
@@ -124,6 +127,7 @@ static struct zwp_pointer_constraints_v1 *pointer_constraints;
 // to reason about which scale a buffer was created with.
 int wl_output_scale_factor = 1;
 int entered_gfx_loop = 0;
+// Buffer scale is frozen once gfx_main enters the render loop.
 
 // The delay in ms which a key must be held to begin repeating..
 int key_repeat_delay_ms = 500;
@@ -148,6 +152,15 @@ do {								\
 		fprint(2, __VA_ARGS__);	\
 	}							\
 } while(0)
+
+static void fatal_wayland(const char *msg) {
+	// Callers must not hold wayland_lock when calling fatal_wayland().
+	wlclip_shutdown();
+	if (wl_display != NULL) {
+		wl_display_disconnect(wl_display);
+	}
+	sysfatal("%s", msg);
+}
 
 static void registry_global(void *data, struct wl_registry *wl_registry,
 	uint32_t name, const char *interface, uint32_t version) {
@@ -175,9 +188,9 @@ static void registry_global(void *data, struct wl_registry *wl_registry,
 		decoration_manager = wl_registry_bind(wl_registry, name,
 			&zxdg_decoration_manager_v1_interface, 1);
 
-	} else if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0) {
-		pointer_constraints = wl_registry_bind(wl_registry, name,
-			&zwp_pointer_constraints_v1_interface, 1);
+	} else if (strcmp(interface, wp_pointer_warp_v1_interface.name) == 0) {
+		pointer_warp = wl_registry_bind(wl_registry, name,
+			&wp_pointer_warp_v1_interface, 1);
 	}
 }
 
@@ -225,133 +238,6 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
 	.ping = xdg_wm_base_ping,
 };
 
-void wl_data_device_listener_data_offer(void *data,
-	struct wl_data_device *wl_data_device, struct wl_data_offer *id) {}
-
-void wl_data_device_listener_data_enter(void *data,
-	struct wl_data_device *wl_data_device, uint32_t serial,
-	struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
-	struct wl_data_offer *id) {}
-
-void wl_data_device_listener_data_leave(void *data,
-	struct wl_data_device *wl_data_device) {}
-
-void wl_data_device_listener_data_motion(void *data,
-	struct wl_data_device *wl_data_device, uint32_t time,
-	wl_fixed_t x, wl_fixed_t y) {}
-
-void wl_data_device_listener_data_drop(void *data,
-	struct wl_data_device *wl_data_device) {}
-
-void wl_data_device_listener_selection(void *data,
-	struct wl_data_device *wl_data_device, struct wl_data_offer *id) {
-	DEBUG("wl_data_device_listener_selection\n");
-
-	if (id == NULL) {
-		qlock(&wayland_lock);
-		free(snarf);
-		snarf = NULL;
-		qunlock(&wayland_lock);
-		DEBUG("wl_data_device_listener_selection: no data\n");
-		return;
-	}
-
-	int fds[2];
-	if (pipe(fds) < 0) {
-		sysfatal("Failed to create pipe");
-	}
-	wl_data_offer_receive(id, "text/plain", fds[1]);
-	close(fds[1]);
-	wl_display_roundtrip(wl_display);
-
-	qlock(&wayland_lock);
-
-	int total = 0;
-	snarf = NULL;
-	for (; ;) {
-		char buf[128];
-		int n = read(fds[0], &buf, sizeof(buf));
-		if (n < 0 && errno == EAGAIN) {
-			continue;
-		}
-		if (n < 0) {
-			sysfatal("Read failed");
-		}
-		if (n == 0) {
-			break;
-		}
-		// +1 to ensure it's always at least null terminated.
-		char *tmp = calloc(1, total + n + 1);
-		if (snarf != NULL) {
-			strncpy(tmp, snarf, total);
-		}
-		memcpy(tmp+total, buf, n);
-		total += n;
-		snarf = tmp;
-	}
-
-	DEBUG("wl_data_device_listener_selection: read [%s]\n", snarf);
-	qunlock(&wayland_lock);
-	close(fds[0]);
-}
-
-static const struct wl_data_device_listener wl_data_device_listener = {
-	.data_offer = wl_data_device_listener_data_offer,
-	.enter = wl_data_device_listener_data_enter,
-	.leave = wl_data_device_listener_data_leave,
-	.motion = wl_data_device_listener_data_motion,
-	.drop = wl_data_device_listener_data_drop,
-	.selection = wl_data_device_listener_selection,
-};
-
-void wl_data_source_target(void *data,
-	struct wl_data_source *wl_data_source,
-	const char *mime_type) {}
-
-void wl_data_source_send(void *data,
-	struct wl_data_source *wl_data_source,
-	const char *mime_type, int32_t fd) {
-	DEBUG("wl_data_source_send(mime_type=%s)\n", mime_type);
-
-	if (strcmp(mime_type, "text/plain") != 0 &&
-		strcmp(mime_type, "UTF8_STRING") != 0) {
-		DEBUG("unknown mime type: %s\n", mime_type);
-		close(fd);
-		return;
-	}
-
-	qlock(&wayland_lock);
-
-	int total = 0;
-	if (snarf != NULL) {
-		total = strlen(snarf);
-	}
-	DEBUG("wl_data_source_send: writing %d bytes\n", total);
-	char *p = snarf;
-	while (total > 0) {
-		int n = write(fd, p, total);
-		if (n < 0 && errno == EAGAIN) {
-			continue;
-		}
-		if (n < 0) {
-			sysfatal("Write error");
-		}
-		p += n;
-		total -= n;
-	}
-
-	qunlock(&wayland_lock);
-	close(fd);
-}
-
-void wl_data_source_cancelled(void *data, struct wl_data_source *wl_data_source) {}
-
-static const struct wl_data_source_listener wl_data_source_listener = {
-	.target = wl_data_source_target,
-	.send = wl_data_source_send,
-	.cancelled = wl_data_source_cancelled,
-};
-
 void delete_buffer(WaylandBuffer *b) {
 	munmap(b->data, b->size);
 	wl_buffer_destroy(b->wl_buffer);
@@ -376,17 +262,27 @@ static const struct wl_buffer_listener wl_buffer_listener = {
 	.release = wl_buffer_release,
 };
 
-#define CSD_BORDER_THICKNESS 4
-#define CSD_MIN_CONTENT_W 64
-#define CSD_MIN_CONTENT_H 48
+#define CSD_BORDER_THICKNESS_SURF 4
+#define CSD_MIN_CONTENT_W_SURF 64
+#define CSD_MIN_CONTENT_H_SURF 48
 
-static int csd_border_thickness(void) {
-	return CSD_BORDER_THICKNESS * wl_output_scale_factor;
+static int csd_border_thickness(WaylandClient *wl) {
+	int scale = wl->buffer_scale;
+	if (scale <= 0) {
+		DEBUG("csd_border_thickness: invalid scale %d\n", scale);
+		return 0;
+	}
+	return CSD_BORDER_THICKNESS_SURF * scale;
+}
+
+static void set_buffer_scale(WaylandClient *wl, int scale) {
+	wl->buffer_scale = scale;
+	wl_surface_set_buffer_scale(wl->wl_surface, scale);
 }
 
 static void update_csd_metrics(WaylandClient *wl) {
 	if (wl->decoration_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
-		wl->csd_thickness = csd_border_thickness();
+		wl->csd_thickness = csd_border_thickness(wl);
 	} else {
 		wl->csd_thickness = 0;
 	}
@@ -394,12 +290,43 @@ static void update_csd_metrics(WaylandClient *wl) {
 	wl->content_offset_y = wl->csd_thickness;
 }
 
+static int surface_to_client_xy(WaylandClient *wl, wl_fixed_t sx, wl_fixed_t sy,
+	int *outx, int *outy, int *out_sx, int *out_sy) {
+	// Expects buffer scale and CSD offsets to be stable during the render loop.
+	int scale = wl->buffer_scale;
+	if (scale <= 0) {
+		return 0;
+	}
+	int x = (int)(wl_fixed_to_double(sx) * scale + 0.5);
+	int y = (int)(wl_fixed_to_double(sy) * scale + 0.5);
+	*out_sx = x;
+	*out_sy = y;
+
+	x -= wl->content_offset_x;
+	y -= wl->content_offset_y;
+	int w = Dx(wl->memimage->r);
+	int h = Dy(wl->memimage->r);
+	if (x < 0) {
+		x = 0;
+	} else if (w > 0 && x >= w) {
+		x = w - 1;
+	}
+	if (y < 0) {
+		y = 0;
+	} else if (h > 0 && y >= h) {
+		y = h - 1;
+	}
+	*outx = x;
+	*outy = y;
+	return 1;
+}
+
 static void set_csd_min_size(WaylandClient *wl) {
-	int min_w = CSD_MIN_CONTENT_W;
-	int min_h = CSD_MIN_CONTENT_H;
+	int min_w = CSD_MIN_CONTENT_W_SURF;
+	int min_h = CSD_MIN_CONTENT_H_SURF;
 	if (wl->decoration_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
-		min_w += 2 * CSD_BORDER_THICKNESS;
-		min_h += 2 * CSD_BORDER_THICKNESS;
+		min_w += 2 * CSD_BORDER_THICKNESS_SURF;
+		min_h += 2 * CSD_BORDER_THICKNESS_SURF;
 	}
 	xdg_toplevel_set_min_size(wl->xdg_toplevel, min_w, min_h);
 }
@@ -450,8 +377,13 @@ void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel,
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	width *= wl_output_scale_factor;
-	height *= wl_output_scale_factor;
+	int scale = wl->buffer_scale;
+	if (scale <= 0) {
+		qunlock(&wayland_lock);
+		return;
+	}
+	width *= scale;
+	height *= scale;
 	int content_w = width;
 	int content_h = height;
 	int t = wl->csd_thickness;
@@ -539,24 +471,17 @@ void wl_pointer_enter(void *data,struct wl_pointer *wl_pointer, uint32_t serial,
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	int x = (int)(wl_fixed_to_double(surface_x) * wl_output_scale_factor + 0.5);
-	int y = (int)(wl_fixed_to_double(surface_y) * wl_output_scale_factor + 0.5);
-	wl->surface_mouse_x = x;
-	wl->surface_mouse_y = y;
-	int w = Dx(wl->memimage->r);
-	int h = Dy(wl->memimage->r);
-	x -= wl->content_offset_x;
-	y -= wl->content_offset_y;
-	if (x < 0) {
-		x = 0;
-	} else if (w > 0 && x >= w) {
-		x = w - 1;
+	int x;
+	int y;
+	int sx_buf;
+	int sy_buf;
+	wl->pointer_enter_serial = serial;
+	if (!surface_to_client_xy(wl, surface_x, surface_y, &x, &y, &sx_buf, &sy_buf)) {
+		qunlock(&wayland_lock);
+		return;
 	}
-	if (y < 0) {
-		y = 0;
-	} else if (h > 0 && y >= h) {
-		y = h - 1;
-	}
+	wl->surface_mouse_x = sx_buf;
+	wl->surface_mouse_y = sy_buf;
 	wl->mouse_x = x;
 	wl->mouse_y = y;
 
@@ -573,6 +498,7 @@ void wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
 	qlock(&wayland_lock);
 
 	wl->buttons = 0;
+	wl->pointer_enter_serial = 0;
 
 	qunlock(&wayland_lock);
 }
@@ -583,24 +509,16 @@ void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	int x = (int)(wl_fixed_to_double(surface_x) * wl_output_scale_factor + 0.5);
-	int y = (int)(wl_fixed_to_double(surface_y) * wl_output_scale_factor + 0.5);
-	wl->surface_mouse_x = x;
-	wl->surface_mouse_y = y;
-	int w = Dx(wl->memimage->r);
-	int h = Dy(wl->memimage->r);
-	x -= wl->content_offset_x;
-	y -= wl->content_offset_y;
-	if (x < 0) {
-		x = 0;
-	} else if (w > 0 && x >= w) {
-		x = w - 1;
+	int x;
+	int y;
+	int sx_buf;
+	int sy_buf;
+	if (!surface_to_client_xy(wl, surface_x, surface_y, &x, &y, &sx_buf, &sy_buf)) {
+		qunlock(&wayland_lock);
+		return;
 	}
-	if (y < 0) {
-		y = 0;
-	} else if (h > 0 && y >= h) {
-		y = h - 1;
-	}
+	wl->surface_mouse_x = sx_buf;
+	wl->surface_mouse_y = sy_buf;
 	wl->mouse_x = x;
 	wl->mouse_y = y;
 	int mx = wl->mouse_x;
@@ -614,6 +532,7 @@ void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 void wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
 	uint32_t time, uint32_t button, uint32_t state) {
 	DEBUG("wl_pointer_button(button=%d)\n", (int) button);
+	wlclip_set_serial(serial);
 	Client* c = data;
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
@@ -778,9 +697,7 @@ void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
 void wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
 	uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
 	DEBUG("wl_keyboard_enter\n");
-	qlock(&wayland_lock);
-	keyboard_enter_serial = serial;
-	qunlock(&wayland_lock);
+	wlclip_set_serial(serial);
 }
 
 void wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
@@ -802,6 +719,7 @@ void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
 	uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
 	Client* c = data;
 	WaylandClient *wl = (WaylandClient*) c->view;
+	wlclip_set_serial(serial);
 	qlock(&wayland_lock);
 
 	wl->repeat_rune = 0;
@@ -964,6 +882,7 @@ static const struct wl_keyboard_listener keyboard_listener = {
 void	gfx_main(void) {
 	DEBUG("gfx_main called\n");
 
+	// Only gfx_main dispatches the Wayland queue; callbacks run on this thread.
 	wl_display = wl_display_connect(NULL);
 	wl_registry = wl_display_get_registry(wl_display);
 	wl_registry_add_listener(wl_registry, &wl_registry_listener, NULL);
@@ -971,42 +890,95 @@ void	gfx_main(void) {
 
 	// Ensure required globals were correctly bound.
 	if (wl_display == NULL) {
-		sysfatal("Unable to get Wayland display");
+		fatal_wayland("Unable to get Wayland display");
 	}
 	if (wl_registry == NULL) {
-		sysfatal("Unable to get Wayland registry");
+		fatal_wayland("Unable to get Wayland registry");
 	}
 	if (wl_output == NULL) {
-		sysfatal("Unable to bind wl_output");
+		fatal_wayland("Unable to bind wl_output");
 	}
 	if (wl_shm == NULL) {
-		sysfatal("Unable to bind wl_shm");
+		fatal_wayland("Unable to bind wl_shm");
 	}
 	if (wl_compositor == NULL) {
-		sysfatal("Unable to bind wl_compositor");
+		fatal_wayland("Unable to bind wl_compositor");
 	}
 	if (xdg_wm_base == NULL) {
-		sysfatal("Unable to bind xdg_wm_base");
+		fatal_wayland("Unable to bind xdg_wm_base");
 	}
 	if (wl_seat == NULL) {
-		sysfatal("Unable to bind wl_seat");
+		fatal_wayland("Unable to bind wl_seat");
 	}
 	if (wl_data_device_manager == NULL) {
-		sysfatal("Unable to bind wl_data_device_manager");
+		fatal_wayland("Unable to bind wl_data_device_manager");
 	}
 	wl_output_add_listener(wl_output, &wl_output_listener, NULL);
 	xdg_wm_base_add_listener(xdg_wm_base, &xdg_wm_base_listener, NULL);
 	wl_data_device = wl_data_device_manager_get_data_device(
 		wl_data_device_manager, wl_seat);
-	wl_data_device_add_listener(wl_data_device, &wl_data_device_listener, NULL);
+	// wlclip_init/pump/poll_fd/drain_wake/set_serial run on gfx_main.
+	wlclip_init(wl_display, wl_data_device_manager, wl_data_device);
 	wl_display_roundtrip(wl_display);
 
 	entered_gfx_loop = 1;
 	gfx_started();
 	DEBUG("gfx_main: entering loop\n");
-	while (wl_display_dispatch(wl_display) > 0 || errno == EAGAIN)
-		;
-	sysfatal("wl_display_dispatch: %r");
+	int display_fd = wl_display_get_fd(wl_display);
+	struct pollfd fds[2];
+	for (;;) {
+		wlclip_pump();
+		while (wl_display_prepare_read(wl_display) != 0) {
+			wl_display_dispatch_pending(wl_display);
+		}
+		wl_display_flush(wl_display);
+
+		fds[0].fd = display_fd;
+		fds[0].events = POLLIN;
+		int nfds = 1;
+		int clip_fd = wlclip_poll_fd();
+		if (clip_fd >= 0) {
+			fds[1].fd = clip_fd;
+			fds[1].events = POLLIN;
+			nfds = 2;
+		}
+
+		int ret = poll(fds, nfds, -1);
+		if (ret < 0) {
+			wl_display_cancel_read(wl_display);
+			if (errno == EINTR) {
+				continue;
+			}
+			fatal_wayland("poll failed");
+		}
+
+		int got_display = fds[0].revents & (POLLIN|POLLERR|POLLHUP);
+		int got_wake = nfds > 1 && (fds[1].revents & (POLLIN|POLLERR|POLLHUP));
+		if (got_wake) {
+			wlclip_drain_wake();
+		}
+
+		if (fds[0].revents & POLLHUP) {
+			wl_display_cancel_read(wl_display);
+			fatal_wayland("Wayland compositor disconnected (POLLHUP)");
+		}
+
+		int pollerr = fds[0].revents & POLLERR;
+		if (got_display) {
+			if (wl_display_read_events(wl_display) < 0) {
+				if (pollerr) {
+					fatal_wayland("wl_display_read_events failed after POLLERR: %r");
+				}
+				fatal_wayland("wl_display_read_events: %r");
+			}
+		} else {
+			wl_display_cancel_read(wl_display);
+			if (pollerr) {
+				fatal_wayland("Wayland display error (POLLERR)");
+			}
+		}
+		wl_display_dispatch_pending(wl_display);
+	}
 }
 
 static void rpc_resizeimg(Client*) {
@@ -1028,7 +1000,7 @@ WaylandBuffer *new_buffer(int w, int h, int format) {
 	snprintf(name, 128, "/acme_wl_shm-%d-%d", getpid(), next_shm++);
 	int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
 	if (fd < 0) {
-		sysfatal("shm_open failed");
+		fatal_wayland("shm_open failed");
 	}
 	shm_unlink(name);
 
@@ -1038,12 +1010,12 @@ WaylandBuffer *new_buffer(int w, int h, int format) {
 		ret = ftruncate(fd, size);
 	} while (ret < 0 && errno == EINTR);
 	if (ret < 0) {
-		sysfatal("ftruncate failed");
+		fatal_wayland("ftruncate failed");
 	}
 
 	char *d = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	if (d == MAP_FAILED) {
-		sysfatal("mmap failed");
+		fatal_wayland("mmap failed");
 	}
 
 	WaylandBuffer *b = malloc(sizeof(WaylandBuffer));
@@ -1079,14 +1051,16 @@ void wayland_set_cursor(WaylandClient *wl, Cursor *cursor) {
 
 	WaylandBuffer *b = new_buffer(16, 16, WL_SHM_FORMAT_ARGB8888);
 	memcpy(b->data, (char*) &data[0], b->size);
+	struct wl_buffer *buf = b->wl_buffer;
 
 	// We don't want to bother saving this buffer in xrgb8888_buffers.
 	// Unmap and use NULL for it's listener data.
 	// This will cause it to be destroyed when it is released.
 	munmap(b->data, b->size);
-	wl_buffer_add_listener(b->wl_buffer, &wl_buffer_listener, NULL);
+	wl_buffer_add_listener(buf, &wl_buffer_listener, NULL);
+	free(b);
 
-	wl_surface_attach(wl->wl_surface_cursor, b->wl_buffer, 0, 0);
+	wl_surface_attach(wl->wl_surface_cursor, buf, 0, 0);
 	wl_surface_damage_buffer(wl->wl_surface_cursor, 0, 0, 16, 16);
 	wl_surface_commit(wl->wl_surface_cursor);
 }
@@ -1114,55 +1088,55 @@ static void rpc_setlabel(Client *c, char *label) {
 }
 
 static void rpc_setmouse(Client *c, Point p) {
-	if (pointer_constraints == NULL) {
-		// If there is no pointer constraints extension,
-		// we cannot warp the mouse.
-		return;
-	}
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	// Wayland does not directly support warping the pointer.
-	// Instead, we use (misuse?) the pointer constraints extension,
-	// which allows sending the compositor a new pointer location
-	// hint when the pointer is unlocked.
-	// We lock the pointer, and immediately unlock it with a hint
-	// of the desired wrap location.
+	struct wp_pointer_warp_v1 *warp = pointer_warp;
+	struct wl_surface *surface = wl->wl_surface;
+	struct wl_pointer *pointer = wl->wl_pointer;
+	uint32_t serial = wl->pointer_enter_serial;
+	double sx_surf = 0;
+	double sy_surf = 0;
+	int do_warp = 0;
 
-	struct zwp_locked_pointer_v1 *lock = zwp_pointer_constraints_v1_lock_pointer(
-		pointer_constraints, wl->wl_surface, wl->wl_pointer, NULL,
-		ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
-	int x = wl_fixed_from_int((p.x + wl->content_offset_x) / wl_output_scale_factor);
-	int y = wl_fixed_from_int((p.y + wl->content_offset_y) / wl_output_scale_factor);
-	zwp_locked_pointer_v1_set_cursor_position_hint(lock, x, y);
-	wl_surface_commit(wl->wl_surface);
-	zwp_locked_pointer_v1_destroy(lock);
-
-	wl->mouse_x = wl_fixed_to_int(x) * wl_output_scale_factor;
-	wl->mouse_y = wl_fixed_to_int(y) * wl_output_scale_factor;
-	wl->surface_mouse_x = wl->mouse_x;
-	wl->surface_mouse_y = wl->mouse_y;
-	wl->mouse_x -= wl->content_offset_x;
-	wl->mouse_y -= wl->content_offset_y;
-	int w = Dx(wl->memimage->r);
-	int h = Dy(wl->memimage->r);
-	if (wl->mouse_x < 0) {
-		wl->mouse_x = 0;
-	} else if (w > 0 && wl->mouse_x >= w) {
-		wl->mouse_x = w - 1;
+	if (warp != NULL && pointer != NULL && serial != 0) {
+		int sw_buf = wl->surface_w;
+		int sh_buf = wl->surface_h;
+		if (sw_buf <= 0 || sh_buf <= 0) {
+			goto done;
+		}
+		// Internal coords are buffer pixels; warp expects surface-local coords.
+		double buf_scale = (double) wl->buffer_scale;
+		if (buf_scale <= 0) {
+			goto done;
+		}
+		sx_surf = (double)(p.x + wl->content_offset_x) / buf_scale;
+		sy_surf = (double)(p.y + wl->content_offset_y) / buf_scale;
+		double max_x_surf = (double) sw_buf / buf_scale;
+		double max_y_surf = (double) sh_buf / buf_scale;
+		if (max_x_surf <= 0 || max_y_surf <= 0) {
+			goto done;
+		}
+		double eps = 1.0 / 256.0;
+		if (sx_surf < 0) {
+			sx_surf = 0;
+		} else if (sx_surf >= max_x_surf) {
+			sx_surf = max_x_surf - eps;
+		}
+		if (sy_surf < 0) {
+			sy_surf = 0;
+		} else if (sy_surf >= max_y_surf) {
+			sy_surf = max_y_surf - eps;
+		}
+		do_warp = 1;
 	}
-	if (wl->mouse_y < 0) {
-		wl->mouse_y = 0;
-	} else if (h > 0 && wl->mouse_y >= h) {
-		wl->mouse_y = h - 1;
-	}
-
-	int mx = wl->mouse_x;
-	int my = wl->mouse_y;
-	int mb = wl->buttons;
-
+	// Warp not available or no valid enter serial.
+done:
 	qunlock(&wayland_lock);
-	gfx_mousetrack(c, mx, my, mb, nsec()/1000000);
+	if (do_warp) {
+		wp_pointer_warp_v1_warp_pointer(warp, surface, pointer,
+			wl_fixed_from_double(sx_surf), wl_fixed_from_double(sy_surf), serial);
+	}
 }
 
 static void rpc_topwin(Client*) {
@@ -1283,7 +1257,7 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 	c->view = wl;
 
 	wl->repeat_interval_ms = key_repeat_ms;
-	wl->repeat_delay_ms = key_repeat_ms;
+	wl->repeat_delay_ms = key_repeat_delay_ms;
 	wl->wl_surface = wl_compositor_create_surface(wl_compositor);
 
 	wl->xdg_surface = xdg_wm_base_get_xdg_surface(xdg_wm_base, wl->wl_surface);
@@ -1319,19 +1293,37 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 	} else {
 		wl->decoration_mode = ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
 	}
+
+	int scale = wl_output_scale_factor;
+	set_buffer_scale(wl, scale);
 	update_csd_metrics(wl);
 	if (wl->decoration_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
 		set_csd_min_size(wl);
 	}
-
-	// TODO: parse winsize.
-	int content_w = 640*wl_output_scale_factor;
-	int content_h = 480*wl_output_scale_factor;
+	int content_w = 640;
+	int content_h = 480;
+	if (winsize != NULL && winsize[0] != '\0') {
+		Rectangle wr;
+		int havemin;
+		if (parsewinsize(winsize, &wr, &havemin) != 0) {
+			USED(havemin);
+			content_w = Dx(wr);
+			content_h = Dy(wr);
+			if (content_w < 1) {
+				content_w = 1;
+			}
+			if (content_h < 1) {
+				content_h = 1;
+			}
+			// Ignore origin; Wayland window placement is compositor-controlled.
+		}
+	}
+	content_w *= scale;
+	content_h *= scale;
 	Rectangle r = Rect(0, 0, content_w, content_h);
 	wl->memimage = _allocmemimage(r, XRGB32);
 	c->mouserect = r;
-	c->displaydpi = 110 * wl_output_scale_factor;
-	wl_surface_set_buffer_scale(wl->wl_surface, wl_output_scale_factor);
+	c->displaydpi = 110 * scale;
 	int t = wl->csd_thickness;
 	wl->surface_w = content_w + 2 * t;
 	wl->surface_h = content_h + 2 * t;
@@ -1344,41 +1336,17 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 
 char *rpc_getsnarf(void) {
 	DEBUG("rpc_getsnarf\n");
-	qlock(&wayland_lock);
-
-	if (snarf == NULL) {
-		qunlock(&wayland_lock);
-		return NULL;
-	}
-
-	int n = strlen(snarf);
-	char *copy = calloc(1, n+1);
-	strncpy(copy, snarf, n);
-	qunlock(&wayland_lock);
-	return copy;
+	return wlclip_getsnarf();
 }
 
-void	rpc_putsnarf(char *snarf_in) {
+void rpc_putsnarf(char *snarf_in) {
 	DEBUG("rpc_putsnarf\n");
-	qlock(&wayland_lock);
-
-	int n = strlen(snarf_in);
-	free(snarf);
-	snarf = calloc(1, n+1);
-	strncpy(snarf, snarf_in, n);
-
-	struct wl_data_source *source =
-		wl_data_device_manager_create_data_source(wl_data_device_manager);
-	wl_data_source_add_listener(source, &wl_data_source_listener, NULL);
-	wl_data_source_offer(source, "text/plain");
-	wl_data_source_offer(source, "UTF8_STRING");
-	wl_data_device_set_selection(wl_data_device, source, keyboard_enter_serial);
-
-	qunlock(&wayland_lock);
+	wlclip_putsnarf(snarf_in);
 }
 
 void	rpc_shutdown(void) {
 	DEBUG("rpc_shutdown\n");
+	wlclip_shutdown();
 }
 
 void rpc_gfxdrawlock(void) {

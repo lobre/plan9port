@@ -1037,20 +1037,22 @@ void
 iconinit(void)
 {
 	Rectangle r;
-	Image *tmp;
+	Point p;
 
 	if(tagcols[BACK] == nil) {
 		/* Blue */
-		tagcols[BACK] = allocimagemix(display, DPalebluegreen, DWhite);
-		tagcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreygreen);
-		tagcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPurpleblue);
+		tagcols[BACK] = display->white;
+		tagcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x72DEC2FF);
+		tagcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x72DEC2FF);
 		tagcols[TEXT] = display->black;
-		tagcols[HTEXT] = display->black;
+		tagcols[HTEXT] = display->white;
 
 		/* Yellow */
 		textcols[BACK] = allocimagemix(display, DPaleyellow, DWhite);
-		textcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DDarkyellow);
-		textcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DYellowgreen);
+		textcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x72DEC2FF);
+		textcols[BORD] = allocimage(display, Rect(0,0,2,2), CMAP8, 1, 0x000000FF);
+		draw(textcols[BORD], Rect(1,1,2,2), display->white, nil, ZP);
+		draw(textcols[BORD], Rect(0,0,1,1), display->white, nil, ZP);
 		textcols[TEXT] = display->black;
 		textcols[HTEXT] = display->black;
 	}
@@ -1066,23 +1068,21 @@ iconinit(void)
 	}
 
 	button = allocimage(display, r, screen->chan, 0, DNofill);
-	draw(button, r, tagcols[BACK], nil, r.min);
-	border(button, r, ButtonBorder, tagcols[BORD], ZP);
+	draw(button, r, tagcols[BORD], nil, r.min);
+	p = Pt(r.min.x + Dx(r)/2, r.min.y + Dy(r)/2);
+	fillellipse(button, p, 3, 3, display->white, ZP);
 
 	r = button->r;
 	modbutton = allocimage(display, r, screen->chan, 0, DNofill);
-	draw(modbutton, r, tagcols[BACK], nil, r.min);
-	border(modbutton, r, ButtonBorder, tagcols[BORD], ZP);
-	r = insetrect(r, ButtonBorder);
-	tmp = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DMedblue);
-	draw(modbutton, r, tmp, nil, ZP);
-	freeimage(tmp);
+	draw(modbutton, r, tagcols[BORD], nil, r.min);
+	r = insetrect(r, 2);
+	p = Pt(r.min.x + Dx(r)/2, r.min.y + Dy(r)/2);
+	fillellipse(modbutton, p, 3, 3, display->black, ZP);
 
 	r = button->r;
-	colbutton = allocimage(display, r, screen->chan, 0, DPurpleblue);
-
-	but2col = allocimage(display, r, screen->chan, 1, 0xAA0000FF);
-	but3col = allocimage(display, r, screen->chan, 1, 0x006600FF);
+	colbutton = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0x72DEC2FF);
+	but2col = allocimage(display, r, screen->chan, 1, 0x000000FF);
+	but3col = allocimage(display, r, screen->chan, 1, 0x72DEC2FF);
 }
 
 /*

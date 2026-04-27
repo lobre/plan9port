@@ -1204,11 +1204,29 @@ _xtoplan9kbd(XEvent *e)
 	XLookupString((XKeyEvent*)e,NULL,0,&k,NULL);
 	if(k == NoSymbol)
 		return -1;
+	if((e->xkey.state&(ControlMask|ShiftMask))==(ControlMask|ShiftMask) && (k=='z' || k=='Z'))
+		return Kctlshiftz;
 
 	if(k&0xFF00){
 		switch(k){
 		case XK_BackSpace:
+			if(e->xkey.state & (ControlMask|Mod1Mask))
+				k = 0x17;
+			else
+				k &= 0x7F;
+			break;
 		case XK_Tab:
+			if(e->xkey.state & ControlMask)
+				k = Kctltab;
+			else
+				k &= 0x7F;
+			break;
+		case XK_ISO_Left_Tab:
+			if(e->xkey.state & ControlMask)
+				k = Kctlshifttab;
+			else
+				k &= 0x7F;
+			break;
 		case XK_Escape:
 		case XK_Delete:
 		case XK_KP_0:
@@ -1240,19 +1258,31 @@ _xtoplan9kbd(XEvent *e)
 			break;
 		case XK_Left:
 		case XK_KP_Left:
-			k = Kleft;
+			if(e->xkey.state & ControlMask)
+				k = Kctlleft;
+			else
+				k = Kleft;
 			break;
 		case XK_Up:
 		case XK_KP_Up:
-			k = Kup;
+			if(e->xkey.state & ControlMask)
+				k = Kctlup;
+			else
+				k = Kup;
 			break;
 		case XK_Down:
 		case XK_KP_Down:
-			k = Kdown;
+			if(e->xkey.state & ControlMask)
+				k = Kctldown;
+			else
+				k = Kdown;
 			break;
 		case XK_Right:
 		case XK_KP_Right:
-			k = Kright;
+			if(e->xkey.state & ControlMask)
+				k = Kctlright;
+			else
+				k = Kright;
 			break;
 		case XK_Page_Down:
 		case XK_KP_Page_Down:
@@ -1272,7 +1302,10 @@ _xtoplan9kbd(XEvent *e)
 			break;
 		case XK_KP_Enter:
 		case XK_Return:
-			k = '\n';
+			if(e->xkey.state & ControlMask)
+				k = Kctlret;
+			else
+				k = '\n';
 			break;
 		case XK_Alt_L:
 		case XK_Meta_L:	/* Shift Alt on PCs */
@@ -1292,7 +1325,7 @@ _xtoplan9kbd(XEvent *e)
 	if(k == XK_hyphen)
 		k = XK_minus;
 	/* Do control mapping ourselves if translator doesn't */
-	if(e->xkey.state&ControlMask)
+	if((e->xkey.state&ControlMask) && k < 0x80)
 		k &= 0x9f;
 	if(k == NoSymbol) {
 		return -1;

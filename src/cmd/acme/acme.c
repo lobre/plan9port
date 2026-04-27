@@ -22,6 +22,11 @@ void	xfidallocthread(void*);
 void	newwindowthread(void*);
 void	plumbproc(void*);
 int	timefmt(Fmt*);
+static void	keyboardfocus(Text*);
+static int	keyboardfocuswin(Window*);
+static int	keyboardfocuscol(Column*);
+static int	keyboardnavwin(int);
+static int	keyboardnavcol(int);
 
 Reffont	**fontcache;
 int		nfontcache;
@@ -482,9 +487,44 @@ keyboardthread(void *v)
 			break;
 		case KKey:
 		casekeyboard:
+			switch(r){
+			case Kctlup:
+				keyboardnavwin(-1);
+				if(nbrecv(keyboardctl->c, &r) > 0)
+					goto casekeyboard;
+				flushimage(display, 1);
+				goto keyhandled;
+			case Kctldown:
+				keyboardnavwin(1);
+				if(nbrecv(keyboardctl->c, &r) > 0)
+					goto casekeyboard;
+				flushimage(display, 1);
+				goto keyhandled;
+			case Kctlshifttab:
+				keyboardnavcol(-1);
+				if(nbrecv(keyboardctl->c, &r) > 0)
+					goto casekeyboard;
+				flushimage(display, 1);
+				goto keyhandled;
+			case Kctltab:
+				keyboardnavcol(1);
+				if(nbrecv(keyboardctl->c, &r) > 0)
+					goto casekeyboard;
+				flushimage(display, 1);
+				goto keyhandled;
+			case 0x14:
+				if(activewin != nil && typetext == &activewin->tag)
+					keyboardfocus(&activewin->body);
+				else if(activewin != nil)
+					keyboardfocus(&activewin->tag);
+				if(nbrecv(keyboardctl->c, &r) > 0)
+					goto casekeyboard;
+				flushimage(display, 1);
+				goto keyhandled;
+			}
 			typetext = rowtype(&row, r, mouse->xy);
 			t = typetext;
-			if(t!=nil && t->col!=nil && !(r==Kdown || r==Kleft || r==Kright))	/* scrolling doesn't change activecol */
+			if(t!=nil && t->col!=nil && !(r==Kscrolloneup || r==Kscrollonedown))	/* scrolling doesn't change activecol */
 				activecol = t->col;
 			if(t!=nil && t->w!=nil)
 				t->w->body.file->curtext = &t->w->body;
@@ -502,9 +542,130 @@ keyboardthread(void *v)
 			if(nbrecv(keyboardctl->c, &r) > 0)
 				goto casekeyboard;
 			flushimage(display, 1);
+		keyhandled:
 			break;
 		}
 	}
+}
+
+static void
+keyboardfocus(Text *t)
+{
+	Point p;
+
+	if(t == nil)
+		return;
+	typetext = t;
+	if(t->w != nil && t == &t->w->body){
+		activewin = t->w;
+		activecol = t->col;
+		barttext = t;
+		t->w->body.file->curtext = t;
+		xfidlog(t->w, "focus");
+	}else if(t->w != nil && t == &t->w->tag){
+		activewin = t->w;
+		activecol = t->col;
+		barttext = t;
+		t->w->body.file->curtext = &t->w->body;
+		xfidlog(t->w, "focus");
+	}else if(t->col != nil){
+		activecol = t->col;
+		if(t->w == nil)
+			activewin = nil;
+	}
+	p = addpt(frptofchar(&t->fr, t->fr.p0), Pt(4, t->fr.font->height-4));
+	moveto(mousectl, p);
+}
+
+static int
+keyboardfocuswin(Window *w)
+{
+	if(w == nil)
+		return 0;
+	keyboardfocus(&w->body);
+	return 1;
+}
+
+static int
+keyboardfocuscol(Column *c)
+{
+	if(c == nil)
+		return 0;
+	if(c->nw > 0)
+		return keyboardfocuswin(c->w[0]);
+	keyboardfocus(&c->tag);
+	return 1;
+}
+
+static int
+keyboardnavwin(int dir)
+{
+	Column *c;
+	Window *w;
+	int i;
+
+	w = activewin;
+	c = nil;
+	if(w != nil)
+		c = w->col;
+	else if(activecol != nil)
+		c = activecol;
+	if(c == nil || c->nw == 0)
+		return 0;
+	if(w == nil)
+		return keyboardfocuswin(c->w[dir < 0 ? c->nw-1 : 0]);
+	for(i=0; i<c->nw; i++)
+		if(c->w[i] == w)
+			break;
+	if(i >= c->nw)
+		return 0;
+	i += dir;
+	if(i < 0 || i >= c->nw)
+		return 0;
+	return keyboardfocuswin(c->w[i]);
+}
+
+static int
+keyboardnavcol(int dir)
+{
+	Column *c, *nc;
+	Row *r;
+	Window *w, *best;
+	int i, j, y, dy, bestdy;
+
+	c = activecol;
+	w = activewin;
+	if(c == nil && w != nil)
+		c = w->col;
+	if(c == nil)
+		return 0;
+	r = c->row;
+	if(r == nil)
+		return 0;
+	for(i=0; i<r->ncol; i++)
+		if(r->col[i] == c)
+			break;
+	if(i >= r->ncol)
+		return 0;
+	i += dir;
+	if(i < 0 || i >= r->ncol)
+		return 0;
+	nc = r->col[i];
+	if(nc->nw == 0)
+		return keyboardfocuscol(nc);
+	if(w == nil)
+		return keyboardfocuswin(nc->w[0]);
+	y = (w->r.min.y + w->r.max.y) / 2;
+	best = nc->w[0];
+	bestdy = abs(((best->r.min.y + best->r.max.y) / 2) - y);
+	for(j=1; j<nc->nw; j++){
+		dy = abs(((nc->w[j]->r.min.y + nc->w[j]->r.max.y) / 2) - y);
+		if(dy < bestdy){
+			best = nc->w[j];
+			bestdy = dy;
+		}
+	}
+	return keyboardfocuswin(best);
 }
 
 void

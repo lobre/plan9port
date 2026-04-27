@@ -21,6 +21,10 @@ enum{
 	TABDIR = 3	/* width of tabs in directory windows */
 };
 
+static uint	textbsline(Text*, uint, int);
+static uint	textbsword(Text*, uint);
+static uint	textfsword(Text*, uint);
+
 void
 textinit(Text *t, File *f, Rectangle r, Reffont *rf, Image *cols[NCOL])
 {
@@ -664,6 +668,65 @@ textcomplete(Text *t)
 	return rp;
 }
 
+static uint
+textbsline(Text *t, uint q, int n)
+{
+	uint q0, q1, col, nc;
+
+	nc = t->file->b.nc;
+	q0 = q;
+	while(q0 > 0 && textreadc(t, q0-1) != '\n')
+		q0--;
+	col = q - q0;
+	if(n < 0){
+		while(n++ < 0){
+			if(q0 == 0)
+				return q;
+			q1 = q0-1;
+			q0 = q1;
+			while(q0 > 0 && textreadc(t, q0-1) != '\n')
+				q0--;
+		}
+		if(col > q1-q0)
+			col = q1-q0;
+		return q0 + col;
+	}
+	while(n-- > 0){
+		q1 = q0;
+		while(q1 < nc && textreadc(t, q1) != '\n')
+			q1++;
+		if(q1 == nc)
+			return q;
+		q0 = q1+1;
+	}
+	q1 = q0;
+	while(q1 < nc && textreadc(t, q1) != '\n')
+		q1++;
+	if(col > q1-q0)
+		col = q1-q0;
+	return q0 + col;
+}
+
+static uint
+textbsword(Text *t, uint q)
+{
+	while(q > 0 && !isalnum(textreadc(t, q-1)))
+		q--;
+	while(q > 0 && isalnum(textreadc(t, q-1)))
+		q--;
+	return q;
+}
+
+static uint
+textfsword(Text *t, uint q)
+{
+	while(q < t->file->b.nc && !isalnum(textreadc(t, q)))
+		q++;
+	while(q < t->file->b.nc && isalnum(textreadc(t, q)))
+		q++;
+	return q;
+}
+
 void
 texttype(Text *t, Rune r)
 {
@@ -681,6 +744,16 @@ texttype(Text *t, Rune r)
 	nr = 1;
 	rp = &r;
 	switch(r){
+	case Kctlleft:
+		typecommit(t);
+		q0 = textbsword(t, t->q0);
+		textshow(t, q0, q0, TRUE);
+		return;
+	case Kctlright:
+		typecommit(t);
+		q0 = textfsword(t, t->q1);
+		textshow(t, q0, q0, TRUE);
+		return;
 	case Kleft:
 		typecommit(t);
 		if(t->q0 > 0)
@@ -694,8 +767,10 @@ texttype(Text *t, Rune r)
 	case Kdown:
 		if(t->what == Tag)
 			goto Tagdown;
-		n = t->fr.maxlines/3;
-		goto case_Down;
+		typecommit(t);
+		q0 = textbsline(t, t->q1, 1);
+		textshow(t, q0, q0, TRUE);
+		return;
 	case Kscrollonedown:
 		if(t->what == Tag)
 			goto Tagdown;
@@ -712,8 +787,10 @@ texttype(Text *t, Rune r)
 	case Kup:
 		if(t->what == Tag)
 			goto Tagup;
-		n = t->fr.maxlines/3;
-		goto case_Up;
+		typecommit(t);
+		q0 = textbsline(t, t->q0, -1);
+		textshow(t, q0, q0, TRUE);
+		return;
 	case Kscrolloneup:
 		if(t->what == Tag)
 			goto Tagup;
@@ -760,17 +837,30 @@ texttype(Text *t, Rune r)
 			q0++;
 		textshow(t, q0, q0, TRUE);
 		return;
+	case 0x03:	/* ^C: copy */
 	case Kcmd+'c':	/* %C: copy */
 		typecommit(t);
 		cut(t, t, nil, TRUE, FALSE, nil, 0);
 		return;
+	case 0x1A:	/* ^Z: undo */
 	case Kcmd+'z':	/* %Z: undo */
 	 	typecommit(t);
 		undo(t, nil, nil, TRUE, 0, nil, 0);
 		return;
+	case Kctlshiftz:	/* ^Shift-Z: redo */
 	case Kcmd+'Z':	/* %-shift-Z: redo */
 	 	typecommit(t);
 		undo(t, nil, nil, FALSE, 0, nil, 0);
+		return;
+	case 0x13:	/* ^S: put */
+		typecommit(t);
+		if(t->w != nil)
+			put(&t->w->body, nil, nil, XXX, XXX, nil, 0);
+		return;
+	case Kctlret:	/* ^Enter: execute selection */
+		typecommit(t);
+		if(t->q1 > t->q0)
+			execute(t, t->q0, t->q1, FALSE, nil);
 		return;
 
 	Tagdown:
@@ -796,6 +886,7 @@ texttype(Text *t, Rune r)
 	}
 	/* cut/paste must be done after the seq++/filemark */
 	switch(r){
+	case 0x18:	/* ^X: cut */
 	case Kcmd+'x':	/* %X: cut */
 		typecommit(t);
 		if(t->what == Body){
@@ -806,6 +897,7 @@ texttype(Text *t, Rune r)
 		textshow(t, t->q0, t->q0, 1);
 		t->iq1 = t->q0;
 		return;
+	case 0x16:	/* ^V: paste */
 	case Kcmd+'v':	/* %V: paste */
 		typecommit(t);
 		if(t->what == Body){
